@@ -8,6 +8,8 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 	"math"
 	"os"
+	"reflect"
+	"strconv"
 )
 
 type (
@@ -89,7 +91,7 @@ func (b *BlockMatrix) Size(blockCount int) int {
 // AddBlock adds a block to the block matrix with the given key and data.  A block effectively has two entries in the
 // key value database: key-> blockNumber, blockNumber -> Block.
 func (b *BlockMatrix) AddBlock(key string, data []byte) error {
-	info, err := b.GetBlockmatrixInfo()
+	info, err := b.GetBlockMatrixInfo()
 	if err != nil {
 		return err
 	}
@@ -107,13 +109,10 @@ func (b *BlockMatrix) AddBlock(key string, data []byte) error {
 
 	// serialize block number to put in to db
 	blockNum := info.BlockCount
-	blockNumBytes := []byte(fmt.Sprint(blockNum))
+	blockNumBytes := []byte(strconv.Itoa(blockNum))
 
 	// construct block
-	block := Block{
-		Data: data,
-		Hash: b.hashData(data),
-	}
+	block := NewBlock(data)
 
 	// serialize block
 	bytes, err := json.Marshal(block)
@@ -141,13 +140,13 @@ func (b *BlockMatrix) updateBlockMatrixInfo(info *BlockMatrixInfo, blockNum int)
 	var err error
 
 	// calculate row hash
-	info.Rows[row], err = b.updateHashes(row, b.RowBlockNumbers, info.Rows)
+	info.Rows[row], err = b.calculateRowHash(row, info.BlockCount)
 	if err != nil {
 		return err
 	}
 
 	// calculate col hash
-	info.Cols[col], err = b.updateHashes(col, b.ColumnBlockNumbers, info.Cols)
+	info.Cols[col], err = b.calculateColumnHash(col, info.BlockCount)
 	if err != nil {
 		return err
 	}
@@ -158,36 +157,6 @@ func (b *BlockMatrix) updateBlockMatrixInfo(info *BlockMatrixInfo, blockNum int)
 	}
 
 	return b.db.Put([]byte("info"), bytes, nil)
-}
-
-func (b *BlockMatrix) updateHashes(index int, blockNumFunc func(int) ([]int, error), hashes [][]byte) ([]byte, error) {
-	h := sha256.New()
-
-	blockNums, err := blockNumFunc(index)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, bn := range blockNums {
-		var (
-			block *Block
-			err   error
-		)
-
-		if block, err = b.GetBlockByNumber(bn); err != nil {
-			return nil, err
-		}
-
-		_, _ = h.Write(block.Hash)
-	}
-
-	return h.Sum(nil), nil
-}
-
-func (b *BlockMatrix) hashData(data []byte) []byte {
-	h := sha256.New()
-	h.Write(data)
-	return h.Sum(nil)
 }
 
 // GetBlock returns the block associated with the given key.
@@ -231,7 +200,12 @@ func (b *BlockMatrix) BlockNumber(key string) (int, error) {
 		return -1, err
 	}
 
-	return int(bytes[0]), nil
+	num, err := strconv.Atoi(string(bytes[0]))
+	if err != nil {
+		return -1, err
+	}
+
+	return num, nil
 }
 
 // EraseBlock erases the data from the block associated with the given key.
@@ -246,23 +220,58 @@ func (b *BlockMatrix) EraseBlock(key string) error {
 		return err
 	}
 
-	// delete block
-	if err = b.db.Delete([]byte(fmt.Sprint(blockNum)), nil); err != nil {
-		return err
-	}
-
-	info, err := b.GetBlockmatrixInfo()
+	// erase block
+	bytes, err := json.Marshal(EmptyBlock())
 	if err != nil {
 		return err
 	}
 
-	// update row and column hashes
-	return b.updateBlockMatrixInfo(info, blockNum)
+	if err = b.db.Put([]byte(fmt.Sprint(blockNum)), bytes, nil); err != nil {
+		return err
+	}
+
+	info, err := b.GetBlockMatrixInfo()
+	if err != nil {
+		return err
+	}
+
+	oldRowHashes := make([][]byte, len(info.Rows))
+	oldColHashes := make([][]byte, len(info.Cols))
+	copy(oldRowHashes, info.Rows)
+	copy(oldColHashes, info.Cols)
+
+	// update row/col hashes
+	if err = b.updateBlockMatrixInfo(info, blockNum); err != nil {
+		return err
+	}
+
+	var ok bool
+	if ok, err = b.checkValidErase(info, oldRowHashes, oldColHashes); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("invalid erase, more than one row/column was affected")
+	}
+
+	return nil
+}
+
+func (b *BlockMatrix) checkValidErase(info *BlockMatrixInfo, oldRowHashes [][]byte, oldColHashes [][]byte) (bool, error) {
+	var numRowChanged, numColChanged int
+
+	for i := 0; i < info.Size; i++ {
+		if !reflect.DeepEqual(oldRowHashes[i], info.Rows[i]) {
+			numRowChanged++
+		} else if !reflect.DeepEqual(oldColHashes[i], info.Cols[i]) {
+			numColChanged++
+		}
+	}
+
+	return numRowChanged == 1 && numColChanged == 1, nil
 }
 
 // Matrix returns a 2D matrix of the blocks in the key value database.
 func (b *BlockMatrix) Matrix() ([][]*Block, error) {
-	info, err := b.GetBlockmatrixInfo()
+	info, err := b.GetBlockMatrixInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +291,7 @@ func (b *BlockMatrix) Matrix() ([][]*Block, error) {
 			return nil, err
 		}
 
-		block := &Block{}
+		block := EmptyBlock()
 		if err = json.Unmarshal(bytes, block); err != nil {
 			return nil, err
 		}
@@ -302,7 +311,7 @@ func (b *BlockMatrix) PrintBlockMatrixData() error {
 
 	table := tablewriter.NewWriter(os.Stdout)
 
-	info, err := b.GetBlockmatrixInfo()
+	info, err := b.GetBlockMatrixInfo()
 	if err != nil {
 		return err
 	}
@@ -380,13 +389,8 @@ func (b *BlockMatrix) locateBlock(blockNum int) (i int, j int) {
 	return
 }
 
-// RowBlockNumbers returns the block numbers for the row at the given index (row index is 0-based)
-func (b *BlockMatrix) RowBlockNumbers(rowIndex int) ([]int, error) {
-	info, err := b.GetBlockmatrixInfo()
-	if err != nil {
-		return nil, err
-	}
-
+// rowBlockNumbers returns the block numbers for the row at the given index (row index is 0-based)
+func (b *BlockMatrix) rowBlockNumbers(rowIndex int, blockCount int) ([]int, error) {
 	blocksNums := make([]int, 0)
 
 	// get the blocks under the diagonal
@@ -398,7 +402,7 @@ func (b *BlockMatrix) RowBlockNumbers(rowIndex int) ([]int, error) {
 	}
 
 	// get the blocks above the diagonal
-	size := b.Size(info.BlockCount)
+	size := b.Size(blockCount)
 	sub := 1
 	for col := rowIndex + 1; col < size; col++ {
 		blockNum := col*col + col - sub
@@ -409,13 +413,8 @@ func (b *BlockMatrix) RowBlockNumbers(rowIndex int) ([]int, error) {
 	return blocksNums, nil
 }
 
-// ColumnBlockNumbers returns the block numbers for the column at the given index (column index is 0-based)
-func (b *BlockMatrix) ColumnBlockNumbers(colIndex int) ([]int, error) {
-	info, err := b.GetBlockmatrixInfo()
-	if err != nil {
-		return nil, err
-	}
-
+// columnBlockNumbers returns the block numbers for the column at the given index (column index is 0-based)
+func (b *BlockMatrix) columnBlockNumbers(colIndex int, blockCount int) ([]int, error) {
 	blocksNums := make([]int, 0)
 
 	// get the blocks above the diagonal
@@ -427,7 +426,7 @@ func (b *BlockMatrix) ColumnBlockNumbers(colIndex int) ([]int, error) {
 	}
 
 	// get the blocks under the diagonal
-	size := b.Size(info.BlockCount)
+	size := b.Size(blockCount)
 	add := 2*colIndex + 2
 	for row := colIndex + 1; row < size; row++ {
 		blockNum := row*row - row + add
@@ -437,7 +436,7 @@ func (b *BlockMatrix) ColumnBlockNumbers(colIndex int) ([]int, error) {
 	return blocksNums, nil
 }
 
-func (b *BlockMatrix) GetBlockmatrixInfo() (*BlockMatrixInfo, error) {
+func (b *BlockMatrix) GetBlockMatrixInfo() (*BlockMatrixInfo, error) {
 	if ok, err := b.db.Has([]byte("info"), nil); err != nil {
 		return nil, err
 	} else if !ok {
@@ -471,48 +470,9 @@ func (b *BlockMatrix) GetBlockmatrixInfo() (*BlockMatrixInfo, error) {
 	return info, nil
 }
 
-func (b *BlockMatrix) updateMatrix(blockNum int) error {
-	row, col := b.locateBlock(blockNum)
-
-	info, err := b.GetBlockmatrixInfo()
-	if err != nil {
-		return err
-	}
-
-	// calculate the new row and column hashes
-	var (
-		rowHash []byte
-		colHash []byte
-	)
-
-	if rowHash, err = b.calculateRowHash(row); err != nil {
-		return err
-	}
-
-	if colHash, err = b.calculateColumnHash(col); err != nil {
-		return err
-	}
-
-	// update row and column hash
-	info.Rows[row] = rowHash
-	info.Cols[col] = colHash
-
-	// update info in DB
-	var infoBytes []byte
-	if infoBytes, err = json.Marshal(info); err != nil {
-		return err
-	}
-
-	if err = b.db.Put([]byte("info"), infoBytes, nil); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (b *BlockMatrix) calculateRowHash(row int) ([]byte, error) {
+func (b *BlockMatrix) calculateRowHash(row int, blockCount int) ([]byte, error) {
 	h := sha256.New()
-	blocks, err := b.RowBlockNumbers(row)
+	blocks, err := b.rowBlockNumbers(row, blockCount)
 	if err != nil {
 		return nil, err
 	}
@@ -529,9 +489,9 @@ func (b *BlockMatrix) calculateRowHash(row int) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
-func (b *BlockMatrix) calculateColumnHash(col int) ([]byte, error) {
+func (b *BlockMatrix) calculateColumnHash(col int, blockCount int) ([]byte, error) {
 	h := sha256.New()
-	blocks, err := b.ColumnBlockNumbers(col)
+	blocks, err := b.columnBlockNumbers(col, blockCount)
 	if err != nil {
 		return nil, err
 	}
@@ -554,8 +514,7 @@ func (b *BlockMatrix) updateBlockMatrixSize(info *BlockMatrixInfo, newSize int) 
 	numBlocksToAdd := 2 * info.Size
 	info.Size = newSize
 	for i := info.BlockCount; i < info.BlockCount+numBlocksToAdd; i++ {
-		block := &Block{}
-		bytes, err := json.Marshal(block)
+		bytes, err := json.Marshal(EmptyBlock())
 		if err != nil {
 			return err
 		}
@@ -569,4 +528,52 @@ func (b *BlockMatrix) updateBlockMatrixSize(info *BlockMatrixInfo, newSize int) 
 	info.Cols = append(info.Cols, make([]byte, 0))
 
 	return nil
+}
+
+func (b *BlockMatrix) IsValid() (bool, error) {
+	info, err := b.GetBlockMatrixInfo()
+	if err != nil {
+		return false, err
+	}
+
+	// check block hashes
+	for i := 1; i <= info.BlockCount; i++ {
+		var block *Block
+		if block, err = b.GetBlockByNumber(i); err != nil {
+			return false, err
+		}
+
+		if reflect.DeepEqual(block.Hash, block.CalculateHash()) {
+			return false, fmt.Errorf("hashes for block %d are not equal", i)
+		}
+	}
+
+	// check row hashes
+	size := b.Size(info.BlockCount)
+	for i := 0; i < size; i++ {
+		var hash []byte
+		if hash, err = b.calculateRowHash(i, info.BlockCount); err != nil {
+			return false, err
+		}
+
+		if reflect.DeepEqual(info.Rows[i], hash) {
+			return false, fmt.Errorf("hashes for row %d are not equal", i)
+		}
+	}
+
+	// check col hashes
+	for i := 0; i < size; i++ {
+		var hash []byte
+		if hash, err = b.calculateColumnHash(i, info.BlockCount); err != nil {
+			return false, err
+		}
+
+		if reflect.DeepEqual(info.Cols[i], hash) {
+			return false, fmt.Errorf("hashes for column %d are not equal", i)
+		}
+	}
+
+	// TODO check if there have been invalid deletions
+
+	return true, nil
 }

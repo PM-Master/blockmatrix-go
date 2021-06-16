@@ -40,16 +40,16 @@ func TestRowBlockNumbers(t *testing.T) {
 
 	err = createTestBlocks(bm, 5)
 	require.NoError(t, err)
-	actual, err := bm.RowBlockNumbers(2)
+	actual, err := bm.rowBlockNumbers(2, 5)
 	require.NoError(t, err)
 	require.Equal(t, []int{4, 6}, actual)
 
 	err = createTestBlocks(bm, 20)
 	require.NoError(t, err)
-	actual, err = bm.RowBlockNumbers(0)
+	actual, err = bm.rowBlockNumbers(0, 5)
 	require.NoError(t, err)
 	require.Equal(t, []int{1, 3, 7, 13, 21}, actual)
-	actual, err = bm.RowBlockNumbers(3)
+	actual, err = bm.rowBlockNumbers(3, 5)
 	require.NoError(t, err)
 	require.Equal(t, []int{8, 10, 12, 19, 27}, actual)
 }
@@ -60,22 +60,22 @@ func TestColumnBlockNumbers(t *testing.T) {
 
 	err = createTestBlocks(bm, 5)
 	require.NoError(t, err)
-	actual, err := bm.ColumnBlockNumbers(1)
+	actual, err := bm.columnBlockNumbers(1, 5)
 	require.NoError(t, err)
 	require.Equal(t, []int{1, 6}, actual)
 
 	err = createTestBlocks(bm, 20)
 	require.NoError(t, err)
-	actual, err = bm.ColumnBlockNumbers(0)
+	actual, err = bm.columnBlockNumbers(0, 5)
 	require.NoError(t, err)
 	require.Equal(t, []int{2, 4, 8, 14, 22}, actual)
-	actual, err = bm.ColumnBlockNumbers(3)
+	actual, err = bm.columnBlockNumbers(3, 5)
 	require.NoError(t, err)
 	require.Equal(t, []int{7, 9, 11, 20, 28}, actual)
 }
 
 func createTestBlocks(bm *BlockMatrix, num int) error {
-	for i := 0; i < num; i++ {
+	for i := 1; i <= num; i++ {
 		err := bm.AddBlock(fmt.Sprintf("key%d", i), []byte{byte(i)})
 		if err != nil {
 			return err
@@ -136,4 +136,23 @@ func TestPrintBlockMatrixData(t *testing.T) {
 
 	err = bm.PrintBlockMatrixData()
 	require.NoError(t, err)
+}
+
+func TestEraseBlock(t *testing.T) {
+	bm, err := New(db)
+	require.NoError(t, err)
+
+	err = bm.AddBlock("key1", []byte{1})
+	require.NoError(t, err)
+
+	err = bm.EraseBlock("key1")
+	require.NoError(t, err)
+
+	block, err := bm.GetBlock("key1")
+	require.Error(t, err)
+
+	block, err = bm.GetBlockByNumber(1)
+	require.NoError(t, err)
+	require.Equal(t, []byte{0}, block.Data)
+	require.Equal(t, calculateHash([]byte{0}), block.Hash)
 }
